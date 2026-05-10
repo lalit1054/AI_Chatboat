@@ -77,14 +77,7 @@ pip install -r requirements.txt
 ### Run the API server:
 
 ```bash
-python3 app/main.py
-```
-
-OR (FastAPI recommended):
-
-```bash
-uvicorn app.main:app --reload
-```
+streamlit run application.py
 
 ---
 
