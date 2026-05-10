@@ -78,9 +78,8 @@ pip install -r requirements.txt
 
 ```bash
 streamlit run application.py
-
+```
 ---
-
 ## 📈 Future Improvements
 
 * 🔊 Voice-based interaction (Speech-to-Text + TTS)
