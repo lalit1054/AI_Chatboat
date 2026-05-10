@@ -1,5 +1,5 @@
 import streamlit as st
-from app.langgraph_backend import chatbot, retrieve_all_threads, save_thread_title, register_user, authenticate_user
+from app.langgraph_backend import chatbot, retrieve_all_threads, save_thread_title, register_user, authenticate_user, process_uploaded_file
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
 import time
@@ -19,6 +19,20 @@ st.markdown("""
     /* Form styling for Auth */
     div[data-testid="stForm"] { border-radius: 15px; border: 1px solid #374151; padding: 2rem; background-color: #111827; }
     div[data-testid="stForm"] label p { color: #ec4899 !important; font-weight: 500; }
+    /* File Uploader styling */
+    [data-testid="stFileUploader"] div,
+    [data-testid="stFileUploader"] span,
+    [data-testid="stFileUploader"] small,
+    [data-testid="stUploadedFile"] * { 
+        color: #ef4444 !important; 
+        font-weight: 500; 
+    }
+    [data-testid="stFileUploader"] button svg,
+    [data-testid="stUploadedFile"] button svg { 
+        fill: #ef4444 !important; 
+        stroke: #ef4444 !important; 
+        color: #ef4444 !important; 
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,7 +55,7 @@ def handle_logout():
     st.session_state["message_history"] = []
 
 if not st.session_state["authenticated"]:
-    st.markdown("<h1 style='text-align: center; margin-bottom: 2rem;'>Welcome to AI Assistant ✨</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center; margin-bottom: 2rem;'>Welcome to Lalit's AI Assistant ✨</h1>", unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
@@ -108,6 +122,7 @@ def reset_chat():
     thread_id = generate_thread_id()
     st.session_state["thread_id"] = thread_id
     st.session_state["message_history"] = []
+    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
     st.rerun()
 
 def load_conversation(thread_id):
@@ -130,6 +145,19 @@ with st.sidebar:
     if st.button("➕ New Chat", use_container_width=True, type="primary"):
         reset_chat()
         
+    st.markdown("---")
+    st.markdown("<h3 style='color: #f97316;'>📄 Upload Knowledge</h3>", unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("Upload PDF/TXT", type=["pdf", "txt"], label_visibility="collapsed", key=f"uploader_{st.session_state.get('uploader_key', 0)}")
+    if uploaded_file is not None:
+        if st.button("Process Document", use_container_width=True):
+            with st.spinner("Processing & indexing..."):
+                file_bytes = uploaded_file.read()
+                res = process_uploaded_file(file_bytes, uploaded_file.name, st.session_state["user_id"], st.session_state["thread_id"])
+                if res["success"]:
+                    st.success(res["message"])
+                else:
+                    st.error(res["error"])
+                    
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("<h3 style='color: #f97316;'>Recent Conversations</h3>", unsafe_allow_html=True)
     
@@ -175,7 +203,7 @@ if user_input:
     st.session_state["message_history"].append({"role": "user", "content": user_input})
     with st.chat_message("user"): st.markdown(user_input)
 
-    CONFIG = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+    CONFIG = {"configurable": {"thread_id": st.session_state["thread_id"], "user_id": st.session_state["user_id"]}}
 
     with st.chat_message("assistant"):
         status_holder = {"box": None}

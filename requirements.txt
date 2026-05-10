@@ -6,3 +6,11 @@ langchain-community
 python-dotenv
 requests
 duckduckgo-search
+pinecone-client
+langchain-pinecone
+pypdf
+tiktoken
+langchain-text-splitters
+psycopg-binary
+psycopg-pool
+langgraph-checkpoint-postgres

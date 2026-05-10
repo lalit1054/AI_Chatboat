@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import requests
 import hashlib
 from typing import TypedDict, Annotated
@@ -7,58 +6,111 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, RemoveMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.tools import tool
+from langchain_core.runnables.config import RunnableConfig
+
+# Postgres specific imports
+import psycopg
+from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres import PostgresSaver
+
+# RAG specific imports
+from pinecone import Pinecone, ServerlessSpec
+from langchain_pinecone import PineconeVectorStore
+from pypdf import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# -------------------
+# Pinecone Init
+# -------------------
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index_name = "chatbot-rag"
+
+if index_name not in pc.list_indexes().names():
+    pc.create_index(
+        name=index_name,
+        dimension=1536,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
+
+def process_uploaded_file(file_bytes: bytes, filename: str, user_id: int, thread_id: str) -> dict:
+    try:
+        text = ""
+        if filename.lower().endswith(".pdf"):
+            import io
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for page in reader.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
+        elif filename.lower().endswith(".txt"):
+            text = file_bytes.decode("utf-8")
+        else:
+            return {"success": False, "error": "Unsupported file format. Please upload PDF or TXT."}
+            
+        if not text.strip():
+            return {"success": False, "error": "Could not extract any text from the file."}
+            
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=300)
+        chunks = text_splitter.split_text(text)
+        
+        from langchain_core.documents import Document
+        docs = [Document(page_content=chunk, metadata={"user_id": user_id, "thread_id": thread_id, "source": filename}) for chunk in chunks]
+        
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        PineconeVectorStore.from_documents(docs, embeddings, index_name=index_name)
+        
+        return {"success": True, "message": f"Successfully processed and indexed {len(chunks)} paragraphs!"}
+    except Exception as e:
+        return {"success": False, "error": f"Error processing file: {str(e)}"}
 
 # -------------------
 # Database Init
 # -------------------
-conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set in .env")
 
-with conn:
-    # 1. Create Users Table
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+pool = ConnectionPool(conninfo=DATABASE_URL, kwargs={"autocommit": True})
+
+with pool.connection() as conn:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
-    
-    # 2. Create Thread Metadata Table
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS thread_metadata (
-            thread_id TEXT PRIMARY KEY,
-            title TEXT,
-            user_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
+        
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_metadata (
+                thread_id TEXT PRIMARY KEY,
+                title TEXT,
+                user_id INTEGER REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
-    
-    # Safely try to add user_id if migrating from older version
-    try:
-        conn.execute("ALTER TABLE thread_metadata ADD COLUMN user_id INTEGER")
-    except sqlite3.OperationalError:
-        pass  # Column already exists or other safe error
+    conn.commit()
 
 # -------------------
 # Auth Helpers
 # -------------------
 def hash_password(password: str) -> str:
-    """Hash a password for storing."""
-    salt = "ai_chatbot_secure_salt_2026"  # In production, use os.urandom(32) and store it with the hash
+    salt = "ai_chatbot_secure_salt_2026"
     return hashlib.pbkdf2_hmac(
         'sha256', 
         password.encode('utf-8'), 
@@ -67,31 +119,34 @@ def hash_password(password: str) -> str:
     ).hex()
 
 def verify_password(password: str, hashed: str) -> bool:
-    """Verify a stored password against one provided by user"""
     return hash_password(password) == hashed
 
 def register_user(username: str, email: str, password: str) -> dict:
     password_hash = hash_password(password)
     try:
-        with conn:
-            cursor = conn.execute(
-                "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-                (username, email, password_hash)
-            )
-            return {"success": True, "user_id": cursor.lastrowid, "username": username}
-    except sqlite3.IntegrityError:
+        with pool.connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s) RETURNING id",
+                    (username, email, password_hash)
+                )
+                user_id = cursor.fetchone()[0]
+                conn.commit()
+                return {"success": True, "user_id": user_id, "username": username}
+    except psycopg.errors.UniqueViolation:
         return {"success": False, "error": "Email already exists. Please sign in."}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 def authenticate_user(email: str, password: str) -> dict:
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, username, password_hash FROM users WHERE email = ?", (email,))
-    user = cursor.fetchone()
-    
-    if user and verify_password(password, user[2]):
-        return {"success": True, "user_id": user[0], "username": user[1]}
-    return {"success": False, "error": "Invalid email or password."}
+    with pool.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, username, password_hash FROM users WHERE email = %s", (email,))
+            user = cursor.fetchone()
+            
+            if user and verify_password(password, user[2]):
+                return {"success": True, "user_id": user[0], "username": user[1]}
+            return {"success": False, "error": "Invalid email or password."}
 
 # -------------------
 # 1. LLM
@@ -102,6 +157,32 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
 # 2. Tools
 # -------------------
 search_tool = DuckDuckGoSearchRun(region="us-en")
+
+@tool
+def search_my_documents(query: str, config: RunnableConfig) -> str:
+    """Search through your uploaded personal documents for information. Use this when the user asks about their own uploaded files or specific data they provided."""
+    try:
+        user_id = config.get("configurable", {}).get("user_id")
+        thread_id = config.get("configurable", {}).get("thread_id")
+        if not user_id or not thread_id:
+            return "Error: user_id or thread_id missing. Cannot perform secure search."
+            
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        vectorstore = PineconeVectorStore(index_name=index_name, embedding=embeddings)
+        
+        docs = vectorstore.similarity_search(query, k=4, filter={"user_id": user_id, "thread_id": thread_id})
+        
+        if not docs:
+            return "No matching information found in your uploaded documents. Perhaps you haven't uploaded anything relevant yet."
+            
+        result = "Here is the relevant information from your documents:\n\n"
+        for i, d in enumerate(docs):
+            result += f"--- Excerpt {i+1} (Source: {d.metadata.get('source', 'Unknown')}) ---\n"
+            result += d.page_content + "\n\n"
+            
+        return result
+    except Exception as e:
+        return f"Error searching documents: {str(e)}"
 
 @tool
 def calculator(first_num: float, second_num: float, operation: str) -> dict:
@@ -122,7 +203,7 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
 def get_stock_price(symbol: str) -> dict:
     """Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') using Alpha Vantage."""
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
-    if not api_key: return {"error": "Alpha Vantage API key is missing. Please add ALPHA_VANTAGE_API_KEY to your .env file."}
+    if not api_key: return {"error": "Alpha Vantage API key is missing."}
     url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
     try:
         r = requests.get(url, timeout=10)
@@ -162,7 +243,7 @@ def get_wikipedia_summary(query: str) -> str:
     except Exception as e:
         return f"Error fetching Wikipedia data: {str(e)}"
 
-tools = [search_tool, get_stock_price, calculator, get_current_datetime, get_weather, get_wikipedia_summary]
+tools = [search_tool, get_stock_price, calculator, get_current_datetime, get_weather, get_wikipedia_summary, search_my_documents]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
@@ -170,52 +251,95 @@ llm_with_tools = llm.bind_tools(tools)
 # -------------------
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    summary: str
 
 # -------------------
 # 4. Nodes & Graph
 # -------------------
 def chat_node(state: ChatState):
     messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
+    summary = state.get("summary", "")
+    
+    sys_prompt_content = """You are a world-class, industry-grade AI assistant. 
+Your core directive is to provide highly detailed, comprehensive, and logically structured answers.
+When explaining concepts, solving problems, or providing guides, always break down your response into clear, step-by-step instructions or logical sections.
+Use markdown formatting (bullet points, bold text, numbered lists, code blocks) to make complex information easy to read.
+Never provide short or overly simplified answers unless explicitly asked. Always strive for maximum depth, accuracy, and professional clarity."""
+
+    if summary:
+        sys_prompt_content += f"\n\nHere is a summary of the earlier conversation: {summary}"
+        
+    sys_prompt = SystemMessage(content=sys_prompt_content)
+    filtered_messages = [m for m in messages if not isinstance(m, SystemMessage)]
+    response = llm_with_tools.invoke([sys_prompt] + filtered_messages)
     return {"messages": [response]}
 
+def summarize_node(state: ChatState):
+    summary = state.get("summary", "")
+    messages = state["messages"]
+    messages_to_summarize = messages[:-2]
+    
+    if not messages_to_summarize:
+        return {}
+        
+    summary_prompt = f"Summarize the following conversation. If there is an existing summary, combine it with the new information into a single cohesive summary. Existing summary: {summary}\n\nNew conversation to summarize:\n"
+    for m in messages_to_summarize:
+        role = "User" if isinstance(m, HumanMessage) else "AI"
+        summary_prompt += f"{role}: {m.content}\n"
+        
+    summary_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    response = summary_llm.invoke(summary_prompt)
+    
+    delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize if m.id is not None]
+    return {"summary": response.content, "messages": delete_messages}
+
+def route_from_chat_node(state: ChatState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if getattr(last_message, "tool_calls", None):
+        return "tools"
+    if len(messages) > 6:
+        return "summarize_node"
+    return END
+
 tool_node = ToolNode(tools)
-checkpointer = SqliteSaver(conn=conn)
+
+# Set up Postgres checkpointer
+checkpointer = PostgresSaver(pool)
+checkpointer.setup()
 
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
 graph.add_node("tools", tool_node)
+graph.add_node("summarize_node", summarize_node)
+
 graph.add_edge(START, "chat_node")
-graph.add_conditional_edges("chat_node", tools_condition)
+graph.add_conditional_edges("chat_node", route_from_chat_node)
 graph.add_edge("tools", "chat_node")
+graph.add_edge("summarize_node", END)
 chatbot = graph.compile(checkpointer=checkpointer)
 
 # -------------------
 # 7. Helpers
 # -------------------
 def retrieve_all_threads(user_id: int):
-    """Retrieve all threads for a specific user, ordered by creation time."""
-    cursor = conn.cursor()
-    cursor.execute("SELECT thread_id, title FROM thread_metadata WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
-    rows = cursor.fetchall()
-    
-    result = []
-    metadata_ids = set()
-    for row in rows:
-        result.append({"id": row[0], "title": row[1] or "New Chat"})
-        metadata_ids.add(row[0])
-        
-    # We could also filter checkpointer list if needed, but the metadata table is the authoritative source for user-bound threads.
-    # To prevent leaking threads from other users, we only return what's in thread_metadata for this user.
-    return result
+    with pool.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT thread_id, title FROM thread_metadata WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+            rows = cursor.fetchall()
+            
+            result = []
+            for row in rows:
+                result.append({"id": row[0], "title": row[1] or "New Chat"})
+            return result
 
 def save_thread_title(thread_id: str, first_message: str, user_id: int):
-    """Generate a title for the thread using LLM and save it, bound to user_id."""
-    cursor = conn.cursor()
-    cursor.execute("SELECT title FROM thread_metadata WHERE thread_id=?", (str(thread_id),))
-    if cursor.fetchone():
-        return # Title exists
-        
+    with pool.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT title FROM thread_metadata WHERE thread_id=%s", (str(thread_id),))
+            if cursor.fetchone():
+                return
+                
     try:
         title_llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=15, temperature=0)
         prompt = f"Generate a very short 2-4 word summary title for this message. No quotes, no punctuation: '{first_message}'"
@@ -224,8 +348,10 @@ def save_thread_title(thread_id: str, first_message: str, user_id: int):
     except Exception:
         title = "New Chat"
         
-    with conn:
-        conn.execute(
-            "INSERT INTO thread_metadata (thread_id, title, user_id) VALUES (?, ?, ?)", 
-            (str(thread_id), title, user_id)
-        )
+    with pool.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO thread_metadata (thread_id, title, user_id) VALUES (%s, %s, %s)", 
+                (str(thread_id), title, user_id)
+            )
+            conn.commit()
